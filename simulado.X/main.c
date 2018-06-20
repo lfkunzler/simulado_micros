@@ -74,29 +74,83 @@
 // #pragma config statements should precede project file includes.
 // Use project enums instead of #define for ON and OFF.
 
-#define _XTAL_FREQ 20000000
-
 #include <xc.h>
+#include <stdint.h>
 
 #define LED1 PORTCbits.RC0
 
-void interrupt low_priority ISR()
+#define _XTAL_FREQ 20000000
+
+volatile uint8_t cont_decseg = 0;
+volatile uint8_t cont_seg = 0;
+volatile short ativo = 0;
+
+void set_dc_percent(uint8_t percent) 
 {
-    if (TMR1IF) { // estouro do timer 1
+    /*
+     * Como foi especificado no projeto, o dutycicle inicial deve ser de 50%
+     * Como o Tpwm é de 1/5000 = 200us, a saida do ccp2 deve ficar em estado
+     * logico alto por 100us. Utilizando a eq 15-2 do datasheet:
+     * 100us = (CCPR2L:CCP2CON<5,4>) * 1/20MHz * 4
+     * (CCPR2L:CCP2CON<5,4>) = 500 = 0x01F4 = 0b0111110100, onde
+     * CCPR2L = 01111101;
+     * CCP2CON<5,4> = 00;
+     */
+    uint16_t dc = percent*10; // multiplica por 10
+    
+    CCP2CONbits.DC2B = dc & 0x0003; // apenas os bits menos significativos
+    CCPR2L = dc>>2; // ignora os 2 bits menos significativos    
+}
+
+void interrupt ISR()
+{
+    if (INT0IE && INT0IF) {
+        set_dc_percent(50);
+        INT0IF = 0; // reconheceu a interrupcao
+    }
+}
+
+void interrupt low_priority ISR_low()
+{
+    if (TMR1IF && TMR1IE) { // estouro do timer 1
         // resseta o timer para dar 100ms
         TMR1H = 0x0B;
         TMR1L = 0xDC;
         LED1 = !LED1;
         
+        cont_decseg++;
+        cont_seg += cont_decseg/10;
+        cont_decseg = cont_decseg % 10;        
+        
         TMR1IF = 0; // limpa flag de interrupcao
+    }
+    
+    if (CCP1IF && CCP1IE) { 
+        if (CCP1CONbits.CCP1M == 0x05) { // se estava em rising edge
+            // quer dizer que o evento acabou
+            ativo = 0; // sinaliza que o processo foi desativado
+            uint8_t dc = cont_seg*10 + cont_decseg;
+            set_dc_percent(dc > 100 ? 100 : dc);
+        }
+        else if (CCP1CONbits.CCP1M == 0x04) { // falling edge
+            // quer dizer que o evento iniciou
+            ativo = 1; // processo esta ativo
+            // zera os contadores de tempo
+            cont_decseg = 0;
+            cont_seg = 0;
+            PORTD = 0xFF; // ao recomecar o novo processo, limpa os leds
+        }        
+        CCP1CONbits.CCP1M ^= 0x01; // inverte o sentido da borda para int        
+        CCP1IF = 0; // sinaliza que a interrupcao foi tratada
     }
 }
 
 void main(void)
 {
     ADCON1 = 0x0F; // all digital    
-    TRISC = 0x00; // portc saida
-
+    TRISC = 0xFC; // RC0 e RC1 saida
+    TRISD = 0x00; // portd saida
+    PORTD = 0xFF; // leds desligados  
     /*
      * Para calcularmos a frequencia do PWM, definimos valores de PR2 e Prescaler
      * Como sabemos que a frequencia deve ser de 5kHz, na equacao...
@@ -122,6 +176,7 @@ void main(void)
      * está em 1. Fazem parte do INTCON
      */
     GIEH = 1; // ativa interrupcoes de alta prioridade
+    //GIEL = 1; // ativa interrupcoes globais de baixa prioridade
     PEIE = 1; // ativa interrupcos de baixa prioridade
 
     // PIR = Peripheral Interrupts Flags
@@ -149,9 +204,9 @@ void main(void)
      * CCPR2L = 01111101;
      * CCP2CON<5,4> = 00;
      */
-    CCPR2L = 0x7D;
-    CCP2CONbits.DC2B = 0;
-
+    //CCPR2L = 0x7D;
+    //CCP2CONbits.DC2B = 0;
+    set_dc_percent(50);
     /* fim do pwm */
 
     /* inicio do timer1 e capture */
@@ -161,7 +216,7 @@ void main(void)
      * PreScaler TMR1 = 8
      * Inicio do timer = 3036
      */
-    //T1CON
+    // CONFIGURA O TIMER1
     T1CONbits.RD16 = 1; // usa 16 bits
     T1CONbits.T1RUN = 0; // nao usa o clock auxiliar
     T1CONbits.T1CKPS1 = 1; // post em 8
@@ -171,14 +226,34 @@ void main(void)
     T1CONbits.TMR1ON = 1; // tmr1 ativo
 
     TMR1IE = 1; // ativa as interrupcoes do timer 1
-
     TMR1IP = 0; // timer1 em baixa prioridade 
     
+    // escreve 3036, para gerar uma interrupcao a cada 100ms
     TMR1H = 0x0B;
     TMR1L = 0xDC;
-
+    
+    // CONFIGURACAO CCP1 COMO CAPTURE
+    // como o sensor gera borda de descida no primeiro marco e borda de descida 
+    // no segundo, configuramos ele inicialmente para capture com falledge
+    CCP1CON = 0x04; // capture mode every falling edge
+    T3CONbits.T3CCP2 = 0; // tmr1 para ccp2 quando capture/compare
+    T3CONbits.T3CCP1 = 0; // tmr1 para ccp1 quando capture/compare
+    
+    PIE1bits.CCP1IE = 1; // habilita interrupcoes pelo ccp1    
+    IPR1bits.CCP1IP = 0; // baixa prioridade para interrupcoes do ccp1
+    /* fim da configuracao do capture */
+    
+    /* configuracao do pino INT0 */
+    INTEDG0 = 0; // interrupt on falling edge
+    INT0IE = 1; // habilita interrupcao no pino    
+    
+    uint8_t segundos = 0;
+    
     while (1) {
-        continue;
+        if (cont_seg > segundos && cont_seg < 8 && ativo) {
+            PORTD <<= 1;
+            segundos = cont_seg; 
+        }        
     }
 
     return;
